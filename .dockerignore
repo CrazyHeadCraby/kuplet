@@ -1,0 +1,9 @@
+node_modules
+.output
+dist
+.git
+artifacts
+screenshots
+attachments
+*.zip
+.DS_Store
