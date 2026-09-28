@@ -70,10 +70,6 @@ function mixHex(from: string, to: string, t: number) {
   return `rgb(${r} ${g} ${b})`;
 }
 
-function snapSize(size: number) {
-  return Math.max(16, Math.round(size / 2) * 2);
-}
-
 function fontAt(size: number) {
   return FONT.replace("{size}", String(Math.round(size)));
 }
@@ -166,10 +162,6 @@ export class PerformanceEngine {
   private playUntil = 0;
   private fitCache = new Map<string, Fitted>();
   private recordSize: { w: number; h: number } | null = null;
-  private recordTrack: CanvasCaptureMediaStreamTrack | null = null;
-  private recordTimer = 0;
-  private nextFrameAt = 0;
-  private uiAt = 0;
 
   unlock() {
     const ctx = this.ensureCtx();
@@ -279,7 +271,6 @@ export class PerformanceEngine {
     this.recordSize = record ? recordFrame(this.script.aspect) : null;
     this.jumpLine(this.script.followCues ? this.lineAt(offset) : -1);
     this.draw();
-    if (record) this.warmFits();
 
     const gen = ++this.playGen;
     this.chunks = [];
@@ -292,24 +283,22 @@ export class PerformanceEngine {
         this.onError?.("Этот браузер не умеет писать видео. Подойдёт Chrome или Edge.");
         return;
       }
-      const canvasStream = this.canvas.captureStream(0);
-      const track = canvasStream.getVideoTracks()[0] as CanvasCaptureMediaStreamTrack | undefined;
-      if (!track) {
+      const canvasStream = this.canvas.captureStream(RECORD_FPS);
+      const videoTracks = canvasStream.getVideoTracks();
+      if (!videoTracks.length) {
         this.recordSize = null;
         this.draw();
         this.onError?.("Не удалось снять кадр.");
         return;
       }
-      this.recordTrack = track;
       const audioTracks = this.recordDest?.stream.getAudioTracks() ?? [];
       if (!audioTracks.length) {
         this.recordSize = null;
-        this.recordTrack = null;
         this.draw();
         this.onError?.("Не удалось захватить звук.");
         return;
       }
-      const mixed = new MediaStream([track, ...audioTracks]);
+      const mixed = new MediaStream([...videoTracks, ...audioTracks]);
       this.mime = pickMime();
       this.recorder = this.makeRecorder(mixed);
       this.recorder.ondataavailable = (event) => {
@@ -322,8 +311,7 @@ export class PerformanceEngine {
     this.startSource(offset, gen);
     this.playing = true;
     this.emit();
-    if (record) this.recordPump();
-    else this.tick();
+    this.tick();
   }
 
   stop(): Promise<void> {
@@ -348,7 +336,7 @@ export class PerformanceEngine {
       canvas.width = w;
       canvas.height = h;
     }
-    const ctx = canvas.getContext("2d", { alpha: false });
+    const ctx = canvas.getContext("2d");
     if (!ctx) return;
     const look = { ...DEFAULT_LOOK, ...(this.script.look ?? {}) };
 
@@ -369,7 +357,7 @@ export class PerformanceEngine {
 
     if (lines.length) {
       const maxWidth = w * 0.86;
-      const gap = focus * 0.5;
+      const gap = focus * 0.42;
       const order = [-1, ...lines.map((_, index) => index)];
       const fitted = new Map<number, Fitted>();
       for (const index of order) {
@@ -377,9 +365,7 @@ export class PerformanceEngine {
           fitted.set(index, { size: focus, rows: [], lh: focus, block: focus * 0.92 });
           continue;
         }
-        const distance = Math.abs(index - center);
-        const size0 = snapSize(dim + (focus - dim) * clamp01(1 - Math.min(distance, 1.15) / 1.15));
-        fitted.set(index, this.fitBlock(ctx, lines[index] ?? "", maxWidth, size0));
+        fitted.set(index, this.fitBlock(ctx, lines[index] ?? "", maxWidth, focus));
       }
       const doc = new Map<number, number>();
       let cursor = 0;
@@ -392,9 +378,9 @@ export class PerformanceEngine {
       const anchor = h * 0.5;
       const topLimit = look.corner.trim() ? h * 0.145 : h * 0.03;
       for (let index = 0; index < lines.length; index++) {
-        const fittedLine = fitted.get(index)!;
+        const slot = fitted.get(index)!;
         const y = anchor + (doc.get(index)! - focusDoc);
-        if (y + fittedLine.block < -8 || y - fittedLine.block > h + 8) continue;
+        if (y + slot.block < -8 || y - slot.block > h + 8) continue;
         const behind = center - index;
         const ahead = index - center;
         const fadeBand = 0.4;
@@ -403,12 +389,23 @@ export class PerformanceEngine {
         if (behind > before) windowFade = clamp01(1 - (behind - before) / fadeBand);
         else if (ahead > after) windowFade = clamp01(1 - (ahead - after) / fadeBand);
         const distance = Math.abs(index - center);
+        const near = clamp01(1 - Math.min(distance, 1));
+        const paintSize = dim + (focus - dim) * near;
         const emphasis = clamp01(1 - distance * 2.15);
         const color = mixHex(look.dim, look.ink, emphasis);
         const edge = clamp01(Math.min(y - topLimit, h * 0.97 - y) / (h * 0.09));
         const alpha = clamp01(edge * windowFade);
         if (alpha < 0.04) continue;
-        this.paintFitted(ctx, fittedLine, w / 2, y, color, look.stroke, look.strokePx, alpha);
+        this.paintFitted(
+          ctx,
+          { size: paintSize, rows: slot.rows, lh: paintSize * 1.12, block: slot.block },
+          w / 2,
+          y,
+          color,
+          look.stroke,
+          look.strokePx,
+          alpha,
+        );
       }
     }
 
@@ -442,28 +439,13 @@ export class PerformanceEngine {
     ctx.fillRect(0, 0, w, h);
   }
 
-  private warmFits() {
-    const canvas = this.canvas;
-    if (!canvas) return;
-    const ctx = canvas.getContext("2d", { alpha: false });
-    if (!ctx) return;
-    const { w } = this.recordSize ?? FRAME[this.script.aspect];
-    const look = { ...DEFAULT_LOOK, ...(this.script.look ?? {}) };
-    const focus = snapSize(focusSize(this.script.aspect, w) * Math.min(1.8, Math.max(0.5, look.fontScale || 1)));
-    const dim = snapSize(focus * 0.72);
-    const maxWidth = w * 0.86;
-    for (const line of this.script.lines) {
-      for (let size = dim; size <= focus; size += 2) this.fitBlock(ctx, line, maxWidth, size);
-    }
-  }
-
   private fitBlock(ctx: CanvasRenderingContext2D, text: string, maxWidth: number, size0: number): Fitted {
-    const asked = snapSize(size0);
+    const asked = Math.max(16, Math.round(size0));
     const key = `${asked}|${Math.round(maxWidth)}|${text}`;
     const cached = this.fitCache.get(key);
     if (cached) return cached;
     let size = Math.max(18, asked);
-    const floor = Math.max(16, snapSize(size0 * 0.62));
+    const floor = Math.max(16, Math.round(size0 * 0.62));
     let rows = [text];
     while (size > floor) {
       ctx.font = fontAt(size);
@@ -497,7 +479,8 @@ export class PerformanceEngine {
     ctx.font = fontAt(fitted.size);
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
-    let y = centerY - fitted.block / 2 + fitted.lh / 2;
+    const textH = Math.max(fitted.lh, fitted.rows.length * fitted.lh);
+    let y = centerY - textH / 2 + fitted.lh / 2;
     for (const row of fitted.rows) {
       this.ink(ctx, row, x, y, fill, strokeColor, stroke);
       y += fitted.lh;
@@ -603,37 +586,6 @@ export class PerformanceEngine {
     this.raf = requestAnimationFrame(this.tick);
   };
 
-  private recordPump = () => {
-    this.raf = requestAnimationFrame((now) => {
-      if (!this.playing || !this.recording) return;
-      if (now + 1 < this.nextFrameAt) {
-        this.recordPump();
-        return;
-      }
-      this.nextFrameAt = now + 1000 / RECORD_FPS;
-      const t = this.time();
-      if (this.script.followCues) {
-        const next = this.lineAt(t);
-        if (next !== this.line) this.setLine(next);
-      }
-      this.draw();
-      try {
-        this.recordTrack?.requestFrame();
-      } catch {
-        /* track already ended */
-      }
-      if (now - this.uiAt > 100) {
-        this.uiAt = now;
-        this.onTick?.(t);
-      }
-      if (t >= this.playUntil - 0.02) {
-        void this.stop();
-        return;
-      }
-      this.recordPump();
-    });
-  };
-
   private startSource(offset: number, gen: number) {
     const ctx = this.ctx;
     const buffer = this.buffer;
@@ -710,10 +662,6 @@ export class PerformanceEngine {
     this.playing = false;
     cancelAnimationFrame(this.raf);
     cancelAnimationFrame(this.previewRaf);
-    window.clearTimeout(this.recordTimer);
-    this.recordTimer = 0;
-    this.nextFrameAt = 0;
-    this.recordTrack = null;
     try {
       this.source?.stop();
     } catch {
